@@ -1,203 +1,359 @@
-
-# ==========================================
-# 二重アーカイブ一括展開
+# ==================================================
+# TAR.GZ 一括展開スクリプト
 # PowerShell 5.1 + 7-Zip + Start-Process
-# ==========================================
+# ==================================================
 
-# --- 設定 ---
+# -------------------------
+# 設定
+# -------------------------
 
 $SevenZip = "C:\Program Files\7-Zip\7z.exe"
 
-$OuterArchive = "D:\Archive\monthly.zip"
+# 外側のアーカイブ
+$OuterArchive = "D:\Archive\monthly.tar.gz"
 
+# 最終的な出力先
 $OutputDir = "D:\Archive\Extracted"
 
+# 一時作業フォルダ（専用の空フォルダを指定）
 $WorkDir = "D:\Archive\Temp"
 
 # 最大同時実行数
 $MaxParallel = 4
 
-# 対応アーカイブ形式
-$Extensions = @(".zip", ".7z", ".rar")
+# -------------------------
+# 共通関数
+# -------------------------
 
-# --- 初期確認 ---
-
-if (!(Test-Path $SevenZip)) {
-    throw "7-Zipが見つかりません: $SevenZip"
+function Quote-Arg([string]$Value) {
+    return '"' + $Value.Replace('"', '\"') + '"'
 }
 
-if (!(Test-Path $OuterArchive)) {
-    throw "入力ファイルが見つかりません: $OuterArchive"
-}
+function Invoke-7ZipBatch {
+    param(
+        [array]$Tasks,
+        [string]$StageName
+    )
 
-if ($MaxParallel -lt 1) {
-    throw "並列数は1以上にしてください。"
-}
+    $Results = New-Object System.Collections.ArrayList
+    $Total = $Tasks.Count
 
-New-Item -ItemType Directory -Path $OutputDir -Force |
-    Out-Null
+    for ($i = 0; $i -lt $Total; $i += $MaxParallel) {
 
-if (Test-Path $WorkDir) {
-    Remove-Item $WorkDir -Recurse -Force
-}
-
-New-Item -ItemType Directory -Path $WorkDir |
-    Out-Null
-
-# --- 外側のアーカイブを展開 ---
-
-Write-Host "外側のアーカイブを展開しています..."
-
-& $SevenZip x $OuterArchive "-o$WorkDir" -y
-
-if ($LASTEXITCODE -ne 0) {
-    throw "外側のアーカイブの展開に失敗しました。"
-}
-
-# --- 内側のアーカイブを検索 ---
-
-$Archives = @(
-    Get-ChildItem -LiteralPath $WorkDir -Recurse -File |
-        Where-Object {
-            $Extensions -contains $_.Extension.ToLower()
-        }
-)
-
-$Total = $Archives.Count
-
-Write-Host "対象アーカイブ数: $Total"
-
-if ($Total -eq 0) {
-    throw "対象アーカイブがありません。"
-}
-
-# --- 並列展開 ---
-
-$Running = @()
-$Results = New-Object System.Collections.ArrayList
-
-$Completed = 0
-
-foreach ($Archive in $Archives) {
-
-    # 最大並列数に達したら、完了を待つ
-    while ($Running.Count -ge $MaxParallel) {
-
-        $Finished = @(
-            $Running | Where-Object {
-                $_.Process.HasExited
-            }
+        $End = [Math]::Min(
+            $i + $MaxParallel - 1,
+            $Total - 1
         )
 
-        if ($Finished.Count -eq 0) {
-            Start-Sleep -Milliseconds 200
-            continue
+        $Batch = @($Tasks[$i..$End])
+        $Running = @()
+
+        # プロセスを起動
+        foreach ($Task in $Batch) {
+
+            $Arguments = @(
+                $Task.Mode
+                (Quote-Arg $Task.Source)
+                ("-o" + (Quote-Arg $Task.Destination))
+                "-y"
+                "-aos"
+                "-mmt=1"
+                "-bso0"
+                "-bsp0"
+            ) -join " "
+
+            try {
+                $Process = Start-Process `
+                    -FilePath $SevenZip `
+                    -ArgumentList $Arguments `
+                    -PassThru `
+                    -WindowStyle Hidden `
+                    -RedirectStandardError $Task.ErrorLog
+
+                $Running += [PSCustomObject]@{
+                    Task = $Task
+                    Process = $Process
+                }
+            }
+            catch {
+                [void]$Results.Add([PSCustomObject]@{
+                    File = $Task.Source
+                    Stage = $StageName
+                    Status = "Failed"
+                    ExitCode = -1
+                    Error = $_.Exception.Message
+                })
+            }
         }
 
-        foreach ($Job in $Finished) {
+        # 起動したプロセスの完了待ち
+        foreach ($Job in $Running) {
 
             $Job.Process.WaitForExit()
 
-            $Status = if ($Job.Process.ExitCode -eq 0) {
+            $Code = $Job.Process.ExitCode
+
+            $Status = if ($Code -eq 0) {
                 "Success"
             } else {
                 "Failed"
             }
 
             [void]$Results.Add([PSCustomObject]@{
-                File = $Job.File
+                File = $Job.Task.Source
+                Stage = $StageName
                 Status = $Status
-                ExitCode = $Job.Process.ExitCode
+                ExitCode = $Code
+                Error = $Job.Task.ErrorLog
             })
-
-            $Completed++
-
-            Write-Host "[$Completed/$Total] $Status : $($Job.File)"
 
             $Job.Process.Dispose()
-            $Running = @($Running | Where-Object {
-                $_ -ne $Job
-            })
         }
+
+        Write-Host "$StageName : $($End + 1) / $Total"
     }
 
-    # 新しい7-Zipプロセスを起動
-    $Arguments = @(
-        "e"
-        "`"$($Archive.FullName)`""
-        "-o`"$OutputDir`""
-        "-y"
-        "-aos"
-        "-mmt=1"
-        "-bso0"
-        "-bsp0"
+    return @($Results)
+}
+
+# -------------------------
+# 初期確認
+# -------------------------
+
+if (!(Test-Path $SevenZip)) {
+    throw "7-Zipが見つかりません。"
+}
+
+if (!(Test-Path $OuterArchive)) {
+    throw "外側のアーカイブが見つかりません。"
+}
+
+if ($MaxParallel -lt 1) {
+    throw "並列数は1以上にしてください。"
+}
+
+if ((Test-Path $WorkDir) -or
+    (Test-Path $OutputDir)) {
+
+    if ($WorkDir -eq $OutputDir) {
+        throw "作業フォルダと出力フォルダを分けてください。"
+    }
+}
+
+New-Item -ItemType Directory `
+    -Path $OutputDir -Force | Out-Null
+
+# 作業フォルダは既存のものを削除せず、安全のため新規作成のみ
+if (Test-Path $WorkDir) {
+    throw "作業フォルダが既に存在します。内容を確認してから指定してください。"
+}
+
+New-Item -ItemType Directory `
+    -Path $WorkDir | Out-Null
+
+$AllResults = New-Object System.Collections.ArrayList
+
+# -------------------------
+# 1. 外側のGZIP解凍
+# -------------------------
+
+Write-Host "外側のGZIPを解凍中..."
+
+$OuterStage = Join-Path $WorkDir "outer"
+
+New-Item -ItemType Directory `
+    -Path $OuterStage | Out-Null
+
+$OuterError = Join-Path $WorkDir "outer-error.log"
+
+$OuterTask = @(
+    [PSCustomObject]@{
+        Mode = "x"
+        Source = $OuterArchive
+        Destination = $OuterStage
+        ErrorLog = $OuterError
+    }
+)
+
+$Result = Invoke-7ZipBatch $OuterTask "Outer GZIP"
+
+foreach ($Item in $Result) {
+    [void]$AllResults.Add($Item)
+}
+
+if (@($Result | Where-Object Status -ne "Success").Count -gt 0) {
+    throw "外側のGZIP解凍に失敗しました。"
+}
+
+$OuterTar = @(
+    Get-ChildItem -LiteralPath $OuterStage `
+        -Filter "*.tar" -File
+)
+
+if ($OuterTar.Count -ne 1) {
+    throw "外側のTARファイルが1つではありません。"
+}
+
+# -------------------------
+# 2. 外側のTAR展開
+# -------------------------
+
+Write-Host "外側のTARを展開中..."
+
+$OuterContent = Join-Path $WorkDir "content"
+
+New-Item -ItemType Directory `
+    -Path $OuterContent | Out-Null
+
+$OuterTarTask = @(
+    [PSCustomObject]@{
+        Mode = "x"
+        Source = $OuterTar[0].FullName
+        Destination = $OuterContent
+        ErrorLog = (Join-Path $WorkDir "outer-tar-error.log")
+    }
+)
+
+$Result = Invoke-7ZipBatch $OuterTarTask "Outer TAR"
+
+foreach ($Item in $Result) {
+    [void]$AllResults.Add($Item)
+}
+
+if (@($Result | Where-Object Status -ne "Success").Count -gt 0) {
+    throw "外側のTAR展開に失敗しました。"
+}
+
+# -------------------------
+# 3. 内側のTAR.GZを検索
+# -------------------------
+
+$Archives = @(
+    Get-ChildItem -LiteralPath $OuterContent `
+        -Recurse -File |
+        Where-Object {
+            $_.Name -match '(?i)\.tar\.gz$'
+        }
+)
+
+$Total = $Archives.Count
+
+Write-Host "内側のアーカイブ数: $Total"
+
+if ($Total -eq 0) {
+    throw "内側のTAR.GZが見つかりません。"
+}
+
+# -------------------------
+# 4. 内側のGZIP解凍
+# -------------------------
+
+$InnerStage = Join-Path $WorkDir "inner"
+
+New-Item -ItemType Directory `
+    -Path $InnerStage | Out-Null
+
+$GzipTasks = @()
+
+for ($i = 0; $i -lt $Total; $i++) {
+
+    $StageDir = Join-Path $InnerStage (
+        "{0:D6}" -f $i
     )
 
-    $Process = Start-Process `
-        -FilePath $SevenZip `
-        -ArgumentList $Arguments `
-        -PassThru `
-        -WindowStyle Hidden
+    New-Item -ItemType Directory `
+        -Path $StageDir | Out-Null
 
-    $Running += [PSCustomObject]@{
-        File = $Archive.Name
-        Process = $Process
+    $GzipTasks += [PSCustomObject]@{
+        Mode = "x"
+        Source = $Archives[$i].FullName
+        Destination = $StageDir
+        ErrorLog = Join-Path $StageDir "gzip-error.log"
     }
 }
 
-# --- 残りのプロセスを回収 ---
+Write-Host "内側のGZIPを並列解凍中..."
 
-foreach ($Job in $Running) {
+$Result = Invoke-7ZipBatch $GzipTasks "Inner GZIP"
 
-    $Job.Process.WaitForExit()
-
-    $Status = if ($Job.Process.ExitCode -eq 0) {
-        "Success"
-    } else {
-        "Failed"
-    }
-
-    [void]$Results.Add([PSCustomObject]@{
-        File = $Job.File
-        Status = $Status
-        ExitCode = $Job.Process.ExitCode
-    })
-
-    $Completed++
-
-    Write-Host "[$Completed/$Total] $Status : $($Job.File)"
-
-    $Job.Process.Dispose()
+foreach ($Item in $Result) {
+    [void]$AllResults.Add($Item)
 }
 
-# --- 結果出力 ---
+# -------------------------
+# 5. 内側のTAR展開
+# -------------------------
+
+$TarTasks = @()
+
+foreach ($Task in $GzipTasks) {
+
+    $TarFiles = @(
+        Get-ChildItem -LiteralPath $Task.Destination `
+            -Filter "*.tar" -File
+    )
+
+    if ($TarFiles.Count -ne 1) {
+
+        [void]$AllResults.Add([PSCustomObject]@{
+            File = $Task.Source
+            Stage = "Inner TAR"
+            Status = "Failed"
+            ExitCode = -1
+            Error = "TARファイルが1つではありません"
+        })
+
+        continue
+    }
+
+    $TarTasks += [PSCustomObject]@{
+        Mode = "e"
+        Source = $TarFiles[0].FullName
+        Destination = $OutputDir
+        ErrorLog = Join-Path $Task.Destination "tar-error.log"
+    }
+}
+
+Write-Host "内側のTARを並列展開中..."
+
+$Result = Invoke-7ZipBatch $TarTasks "Inner TAR"
+
+foreach ($Item in $Result) {
+    [void]$AllResults.Add($Item)
+}
+
+# -------------------------
+# 6. 結果出力
+# -------------------------
 
 $LogPath = Join-Path $OutputDir "extract-log.csv"
 
-$Results | Export-Csv `
+$AllResults | Export-Csv `
     -Path $LogPath `
     -NoTypeInformation `
     -Encoding UTF8
 
-$Success = @(
-    $Results | Where-Object Status -eq "Success"
+$Failed = @(
+    $AllResults | Where-Object Status -ne "Success"
 ).Count
 
-$Failed = @(
-    $Results | Where-Object Status -eq "Failed"
+$Success = @(
+    $AllResults | Where-Object Status -eq "Success"
 ).Count
 
 Write-Host ""
 Write-Host "========== 処理結果 =========="
-Write-Host "対象: $Total"
-Write-Host "成功: $Success"
-Write-Host "失敗: $Failed"
+Write-Host "内側のアーカイブ数: $Total"
+Write-Host "成功処理数: $Success"
+Write-Host "失敗処理数: $Failed"
 Write-Host "ログ: $LogPath"
 
 if ($Failed -eq 0) {
+
     Remove-Item $WorkDir -Recurse -Force
-    Write-Host "一時フォルダを削除しました。"
+
+    Write-Host "すべて成功。一時フォルダを削除しました。"
 }
 else {
-    Write-Host "失敗があるため一時フォルダを保持します。"
+    Write-Host "失敗あり。一時フォルダを保持しています。"
 }
